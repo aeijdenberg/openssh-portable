@@ -180,11 +180,12 @@ delete_all(int agent_fd)
 static int
 add_file(int agent_fd, const char *filename, int key_only)
 {
-	struct sshkey *private, *cert;
+	struct sshkey *private, *cert = NULL;
 	char *comment = NULL;
 	char msg[1024], *certpath = NULL;
 	int r, fd, ret = -1;
 	struct sshbuf *keyblob;
+	time_t now, ttl;
 
 	if (strcmp(filename, "-") == 0) {
 		fd = STDIN_FILENO;
@@ -262,6 +263,52 @@ add_file(int agent_fd, const char *filename, int key_only)
 		comment = xstrdup(filename);
 	sshbuf_free(keyblob);
 
+	/*
+	 * Before adding, check if a certificate exists. If it does, we'll use that to
+	 * get an upper bound on an expiry time.
+	 */
+
+	/* Skip trying to load the cert if requested */
+	if (!key_only) {
+		/* Now try to add the certificate flavour too */
+		xasprintf(&certpath, "%s-cert.pub", filename);
+		if ((r = sshkey_load_public(certpath, &cert, NULL)) != 0) {
+			if (r != SSH_ERR_SYSTEM_ERROR || errno != ENOENT)
+				error("Failed to load certificate \"%s\": %s",
+				    certpath, ssh_err(r));
+		}
+	}
+
+	/* If we do have a cert, check it matches the key and checkout against our lifetime param */
+	if (cert != NULL) {
+		if (!sshkey_equal_public(cert, private)) {
+			error("Certificate %s does not match private key %s",
+			    certpath, filename);
+			goto out;
+		}
+
+		now = time(NULL);
+		if ((int)cert->cert->valid_after > now)
+			fprintf(stderr, "Warning: Certificate %s is not ready for use yet. Valid after: %lld. Adding anyway...\n",
+			    certpath, cert->cert->valid_after);
+
+		ttl = cert->cert->valid_before - now;
+		if (ttl <= 0) {
+			error("Certificate %s has expired. Valid before: %lld.",
+			    certpath, cert->cert->valid_before);
+			goto out;
+		}
+
+		if (lifetime == 0) {
+			lifetime = ttl;
+			fprintf(stderr, "Set lifetime to %d to match certificate expiry time.\n", lifetime);
+		} else if (ttl < lifetime) {
+			lifetime = ttl;
+			fprintf(stderr, "Reducing lifetime to %d to match certificate expiry time.\n", lifetime);
+		}
+	}
+
+	/* Now add the key */
 	if ((r = ssh_add_identity_constrained(agent_fd, private, comment,
 	    lifetime, confirm)) == 0) {
 		fprintf(stderr, "Identity added: %s (%s)\n", filename, comment);
@@ -274,58 +321,40 @@ add_file(int agent_fd, const char *filename, int key_only)
 			    "The user must confirm each use of the key\n");
 	} else {
 		fprintf(stderr, "Could not add identity \"%s\": %s\n",
-		    filename, ssh_err(r));
+	            filename, ssh_err(r));
 	}
 
-	/* Skip trying to load the cert if requested */
-	if (key_only)
-		goto out;
+	/* And finally add the cert */
+	if (cert != NULL) {
+		/* Graft with private bits */
+		if ((r = sshkey_to_certified(private)) != 0) {
+			error("%s: sshkey_to_certified: %s", __func__, ssh_err(r));
+			goto out;
+		}
+		if ((r = sshkey_cert_copy(cert, private)) != 0) {
+			error("%s: key_cert_copy: %s", __func__, ssh_err(r));
+			goto out;
+		}
 
-	/* Now try to add the certificate flavour too */
-	xasprintf(&certpath, "%s-cert.pub", filename);
-	if ((r = sshkey_load_public(certpath, &cert, NULL)) != 0) {
-		if (r != SSH_ERR_SYSTEM_ERROR || errno != ENOENT)
-			error("Failed to load certificate \"%s\": %s",
-			    certpath, ssh_err(r));
-		goto out;
+		if ((r = ssh_add_identity_constrained(agent_fd, private, comment,
+		    lifetime, confirm)) != 0) {
+			error("Certificate %s (%s) add failed: %s", certpath,
+			    private->cert->key_id, ssh_err(r));
+			goto out;
+		}
+		fprintf(stderr, "Certificate added: %s (%s)\n", certpath,
+		    private->cert->key_id);
+		if (lifetime != 0)
+			fprintf(stderr, "Lifetime set to %d seconds\n", lifetime);
+		if (confirm != 0)
+			fprintf(stderr, "The user must confirm each use of the key\n");
 	}
-
-	if (!sshkey_equal_public(cert, private)) {
-		error("Certificate %s does not match private key %s",
-		    certpath, filename);
-		sshkey_free(cert);
-		goto out;
-	} 
-
-	/* Graft with private bits */
-	if ((r = sshkey_to_certified(private)) != 0) {
-		error("%s: sshkey_to_certified: %s", __func__, ssh_err(r));
-		sshkey_free(cert);
-		goto out;
-	}
-	if ((r = sshkey_cert_copy(cert, private)) != 0) {
-		error("%s: key_cert_copy: %s", __func__, ssh_err(r));
-		sshkey_free(cert);
-		goto out;
-	}
-	sshkey_free(cert);
-
-	if ((r = ssh_add_identity_constrained(agent_fd, private, comment,
-	    lifetime, confirm)) != 0) {
-		error("Certificate %s (%s) add failed: %s", certpath,
-		    private->cert->key_id, ssh_err(r));
-		goto out;
-	}
-	fprintf(stderr, "Certificate added: %s (%s)\n", certpath,
-	    private->cert->key_id);
-	if (lifetime != 0)
-		fprintf(stderr, "Lifetime set to %d seconds\n", lifetime);
-	if (confirm != 0)
-		fprintf(stderr, "The user must confirm each use of the key\n");
  out:
 	free(certpath);
 	free(comment);
 	sshkey_free(private);
+	if (cert != NULL)
+		sshkey_free(cert);
 
 	return ret;
 }
